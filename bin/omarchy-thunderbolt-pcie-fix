@@ -1,0 +1,239 @@
+#!/bin/bash
+# omarchy-thunderbolt-pcie-fix
+#
+# Detects and fixes a firmware bug seen on some laptops (confirmed on a
+# Lenovo T490s/X390 with an HP Thunderbolt Dock G4, but not specific to
+# that combination) where the BIOS reserves too small an MMIO window for
+# Thunderbolt/USB4 hotplug PCIe bridges. Anything tunneled behind the dock
+# with a nontrivial PCIe footprint -- typically its USB hub and/or built-in
+# Ethernet -- then fails to bind a driver:
+#
+#   pci 0000:0N:00.0: bridge window [mem size 0x00500000]: can't assign; no space
+#   xhci_hcd 0000:07:00.0: init 0000:07:00.0 fail, -16
+#   igc 0000:09:00.0: probe with driver igc failed with error -5
+#
+# The fix is the `pci=realloc=on` kernel parameter, which makes Linux
+# redo BAR/window sizing itself instead of trusting the firmware's
+# undersized reservation.
+#
+# Getting that parameter to actually take effect is the nonobvious part
+# on a Limine + mkinitcpio-UKI system (the Omarchy default): rebuilding
+# the UKI via `kernel-install`/`limine-update` does NOT reliably embed a
+# brand-new cmdline parameter, because limine-mkinitcpio's cmdline
+# resolution prefers /proc/cmdline (the live, already-booted cmdline)
+# over /etc/kernel/cmdline outside a chroot -- a new parameter can't be
+# embedded via rebuild until you've already booted with it once. This
+# script works around that by editing the live boot entry's `cmdline:`
+# line directly in /boot/limine.conf, which is what Limine actually
+# passes as LoadOptions at boot, independent of what is embedded in the
+# UKI. Once you've booted successfully with the parameter active once,
+# /proc/cmdline includes it and every future rebuild keeps it correctly
+# on its own -- this is a one-time bootstrapping fix, not an ongoing one.
+#
+# Usage:
+#   omarchy-thunderbolt-pcie-fix --check [--quiet]   # read-only; exit 0 = fine, 1 = needs fix
+#   sudo omarchy-thunderbolt-pcie-fix [--force]      # apply the fix
+#
+# --force skips the detection gate and applies pci=realloc=on regardless
+# (useful if your kernel journal doesn't show the exact signature this
+# script looks for, but you know you're hitting this bug).
+
+set -uo pipefail
+
+CMDLINE_FILE="/etc/kernel/cmdline"
+LIMINE_CONF="/boot/limine.conf"
+GRUB_DEFAULT_FILE="/etc/default/grub"
+PARAM="pci=realloc=on"
+
+MODE="fix"
+QUIET=0
+FORCE=0
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  omarchy-thunderbolt-pcie-fix --check [--quiet]
+      Read-only. Prints what it finds. Exit 0 = no fix needed (either
+      already applied, or no symptoms detected). Exit 1 = symptoms
+      detected and the fix has not been applied yet.
+
+  sudo omarchy-thunderbolt-pcie-fix [--force]
+      Applies the fix: appends pci=realloc=on to /etc/kernel/cmdline
+      (backed up first) and, on Limine systems, patches the live boot
+      entry's cmdline directly in /boot/limine.conf (also backed up).
+      Refuses to do anything unless the detection check finds the bug's
+      signature, unless --force is given. Always reboot afterward to
+      test -- this cannot take effect without one.
+USAGE
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --check) MODE="check" ;;
+    --fix) MODE="fix" ;;
+    --force) FORCE=1 ;;
+    --quiet) QUIET=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $arg" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+log() { (( QUIET )) || echo "$@"; }
+
+already_fixed() {
+  grep -qw "$PARAM" /proc/cmdline 2>/dev/null
+}
+
+# Conservative on purpose: only true when a Thunderbolt device is actually
+# authorized *and* this boot's kernel journal shows the specific pairing of
+# a PCI bridge/BAR "no space" allocation failure with a driver probe
+# failure -- not just any unrelated PCI warning.
+detect_symptom() {
+  command -v boltctl >/dev/null 2>&1 || return 1
+  boltctl list 2>/dev/null | grep -q "status:.*authorized" || return 1
+
+  local journal
+  journal=$(journalctl -k -b --no-pager 2>/dev/null) || return 1
+  grep -q "can't assign; no space" <<<"$journal" || return 1
+  grep -qE "probe (with driver [A-Za-z0-9_]+ )?failed with error -(5|16)" <<<"$journal" || return 1
+  return 0
+}
+
+run_check() {
+  if already_fixed; then
+    log "pci=realloc=on is active on the running kernel. Nothing to do."
+    return 0
+  fi
+
+  if detect_symptom; then
+    log "Detected the Thunderbolt/USB4 PCIe MMIO-starvation signature in this boot's kernel journal, and pci=realloc=on is not active."
+    log "Run: sudo $0"
+    return 1
+  fi
+
+  log "No symptoms detected and pci=realloc=on is not active. If you know you're hitting this bug anyway, re-run with --force."
+  return 0
+}
+
+backup_file() {
+  local file="$1"
+  cp -p "$file" "$file.bak.$(date +%s)"
+}
+
+append_cmdline_param() {
+  if grep -qw "$PARAM" "$CMDLINE_FILE" 2>/dev/null; then
+    log "$CMDLINE_FILE already has $PARAM."
+    return 0
+  fi
+  backup_file "$CMDLINE_FILE"
+  printf '%s %s\n' "$(cat "$CMDLINE_FILE")" "$PARAM" > "$CMDLINE_FILE"
+  log "Appended $PARAM to $CMDLINE_FILE (backup saved alongside it)."
+}
+
+# Patches the cmdline: line of every non-snapshot boot entry in
+# limine.conf. Deliberately general rather than matching a specific
+# rootflags/subvol value, so it works regardless of the reader's disk
+# layout: any column-0 line starts a new top-level menu entry (resetting
+# snapshot state), and a "//Snapshots" sub-block is skipped so historical
+# btrfs-snapshot boot entries are left untouched.
+patch_limine_conf() {
+  [[ -f "$LIMINE_CONF" ]] || return 1
+
+  if grep -q "cmdline:.*\b${PARAM}\b" "$LIMINE_CONF"; then
+    log "$LIMINE_CONF's live entry already has $PARAM."
+    return 0
+  fi
+
+  backup_file "$LIMINE_CONF"
+  local tmp
+  tmp=$(mktemp "$LIMINE_CONF.XXXXXX")
+  awk -v param="$PARAM" '
+    /^\// { in_snap = 0 }
+    /^[[:space:]]+\/\/Snapshots/ { in_snap = 1 }
+    {
+      if (!in_snap && $0 ~ /^[[:space:]]*cmdline:/ && index($0, param) == 0) {
+        print $0 " " param
+      } else {
+        print $0
+      }
+    }
+  ' "$LIMINE_CONF" > "$tmp"
+
+  if ! grep -q "cmdline:.*\b${PARAM}\b" "$tmp"; then
+    rm -f "$tmp"
+    log "ERROR: could not find a live cmdline: line to patch in $LIMINE_CONF -- leaving it untouched."
+    return 1
+  fi
+
+  mv "$tmp" "$LIMINE_CONF"
+  log "Patched the live boot entry's cmdline: line in $LIMINE_CONF directly (this is what Limine actually boots with, independent of the UKI rebuild)."
+  return 0
+}
+
+try_grub() {
+  [[ -f "$GRUB_DEFAULT_FILE" ]] || return 1
+  command -v grub-mkconfig >/dev/null 2>&1 || return 1
+
+  if grep -q "$PARAM" "$GRUB_DEFAULT_FILE"; then
+    log "$GRUB_DEFAULT_FILE already has $PARAM."
+  else
+    backup_file "$GRUB_DEFAULT_FILE"
+    if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_DEFAULT_FILE"; then
+      sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 $PARAM\"/" "$GRUB_DEFAULT_FILE"
+    else
+      printf 'GRUB_CMDLINE_LINUX_DEFAULT="%s"\n' "$PARAM" >> "$GRUB_DEFAULT_FILE"
+    fi
+    log "Added $PARAM to GRUB_CMDLINE_LINUX_DEFAULT in $GRUB_DEFAULT_FILE."
+  fi
+
+  local grub_cfg="/boot/grub/grub.cfg"
+  [[ -f "$grub_cfg" ]] || grub_cfg="/boot/efi/EFI/*/grub.cfg"
+  log "Regenerating GRUB config..."
+  grub-mkconfig -o "$grub_cfg" && log "Done."
+  return 0
+}
+
+run_fix() {
+  if (( EUID != 0 )); then
+    echo "This needs root. Re-run as: sudo $0 ${*:-}" >&2
+    exit 1
+  fi
+
+  if already_fixed; then
+    log "pci=realloc=on is already active on the running kernel. Nothing to do."
+    exit 0
+  fi
+
+  if (( ! FORCE )) && ! detect_symptom; then
+    log "No Thunderbolt/USB4 PCIe-starvation signature detected in this boot's kernel journal."
+    log "If you're confident you're hitting this bug anyway, re-run with --force."
+    exit 0
+  fi
+
+  append_cmdline_param
+
+  if [[ -f "$LIMINE_CONF" ]]; then
+    patch_limine_conf
+  elif try_grub; then
+    :
+  elif command -v kernel-install >/dev/null 2>&1; then
+    log "Attempting a systemd-boot loader-entry rebuild via kernel-install..."
+    kernel-install add-all && log "Done. Plain systemd-boot entries (non-UKI-embedded 'options' line) should now carry $PARAM directly."
+  else
+    log "Could not identify a supported bootloader (Limine/GRUB/systemd-boot) to patch automatically."
+    log "$CMDLINE_FILE has been updated; you'll need to make your bootloader pick that up manually."
+  fi
+
+  log
+  log "Done. Reboot to test: systemctl reboot"
+  log "After rebooting, verify with:"
+  log "  grep -o $PARAM /proc/cmdline"
+  log "  ip link                 # look for a new NIC behind the dock"
+  log "  lsusb                   # look for a new USB bus/hub from the dock"
+  log "  lspci -k                # dock's USB/Ethernet controllers should now show 'Kernel driver in use'"
+}
+
+case "$MODE" in
+  check) run_check; exit $? ;;
+  fix) run_fix ;;
+esac

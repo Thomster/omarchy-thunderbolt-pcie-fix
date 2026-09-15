@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "thunderbolt-pcie-fix",
+  "name": "Thunderbolt PCIe Fix",
+  "version": "1.0.0",
+  "author": "Omarchy",
+  "description": "Detects the firmware PCIe MMIO-starvation bug that leaves a Thunderbolt/USB4 dock's USB hub and Ethernet unbound, and notifies you to run the bundled fix. No bar icon.",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}
