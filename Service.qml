@@ -18,7 +18,11 @@ Item {
   readonly property string home: Quickshell.env("HOME")
   readonly property string pluginDir: home + "/.config/omarchy/plugins/thunderbolt-pcie-fix"
   readonly property string fixScript: pluginDir + "/bin/omarchy-thunderbolt-pcie-fix"
-  readonly property string stateDir: home + "/.local/state/omarchy/indicators"
+  // Boot-scoped (tmpfs, cleared automatically every boot/logout) rather than
+  // ~/.local/state: these markers exist only to dedupe repeat notifications
+  // within a single boot, and a marker that outlived its boot would
+  // permanently suppress the notification for a real future regression.
+  readonly property string stateDir: Quickshell.env("XDG_RUNTIME_DIR") + "/omarchy/indicators"
   // Separate marker per exit code, not one shared marker: a boot can
   // legitimately pass through "needs fix" (1) and, once you've run it,
   // "staged, reboot" (2) in the same session, and each transition is worth
