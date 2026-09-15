@@ -3,10 +3,13 @@ import Quickshell
 import Quickshell.Io
 
 // Headless: watches for the Thunderbolt/USB4 PCIe MMIO-starvation firmware
-// bug and sends one notification per boot pointing at the bundled fix
-// script. Never applies the fix itself -- that needs root, edits boot
-// config, and needs a reboot to verify, none of which a background shell
-// service should ever do unattended.
+// bug and sends one notification per boot -- pointing at the bundled fix
+// script if it hasn't been run yet, or telling you to just reboot if it
+// has (the two are distinguished by the fix script's own --check exit
+// code; see its own comments for why the unprivileged distinction is only
+// approximate). Never applies the fix itself -- that needs root, edits
+// boot config, and needs a reboot to verify, none of which a background
+// shell service should ever do unattended.
 Item {
   id: root
 
@@ -15,42 +18,53 @@ Item {
   readonly property string home: Quickshell.env("HOME")
   readonly property string pluginDir: home + "/.config/omarchy/plugins/thunderbolt-pcie-fix"
   readonly property string fixScript: pluginDir + "/bin/omarchy-thunderbolt-pcie-fix"
-  readonly property string notifiedStatePath: home + "/.local/state/omarchy/indicators/thunderbolt-pcie-fix-notified"
+  readonly property string stateDir: home + "/.local/state/omarchy/indicators"
+  // Separate marker per exit code, not one shared marker: a boot can
+  // legitimately pass through "needs fix" (1) and, once you've run it,
+  // "staged, reboot" (2) in the same session, and each transition is worth
+  // its own one-time notification rather than only ever firing once total.
+  readonly property string neededMarker: stateDir + "/thunderbolt-pcie-fix-notified-needed"
+  readonly property string stagedMarker: stateDir + "/thunderbolt-pcie-fix-notified-staged"
 
   function runCheck() {
     if (checkProcess.running) return
     checkProcess.running = true
   }
 
-  // Only ever notifies once per boot: the marker file lives under
-  // ~/.local/state, which does not get cleared on a normal reboot, so a
-  // fresh boot without the marker means either this is the first check
-  // since boot or the fix already landed and got reverted -- worth telling
-  // the user about again either way.
+  function notifyOnce(marker, title, body) {
+    notifyProcess.command = ["bash", "-c",
+      "mkdir -p " + JSON.stringify(root.stateDir) + "; " +
+      "[[ -f " + JSON.stringify(marker) + " ]] && exit 0; " +
+      "touch " + JSON.stringify(marker) + "; " +
+      "omarchy-notification-send -u normal " + JSON.stringify(title) + " " + JSON.stringify(body)
+    ]
+    notifyProcess.running = true
+  }
+
   Process {
     id: checkProcess
     command: ["bash", root.fixScript, "--check", "--quiet"]
     onExited: function(exitCode) {
-      if (exitCode !== 1) return
-      notifyIfNeededProcess.running = true
+      if (exitCode === 1) {
+        root.notifyOnce(root.neededMarker,
+          "Thunderbolt dock may need a fix",
+          "USB/Ethernet behind a Thunderbolt dock look unbound due to a firmware PCIe bug. Run: " + root.fixScript)
+      } else if (exitCode === 2) {
+        root.notifyOnce(root.stagedMarker,
+          "Thunderbolt dock fix needs a reboot",
+          "The PCIe fix has already been applied but isn't active yet. Reboot to finish: systemctl reboot")
+      }
     }
   }
 
   Process {
-    id: notifyIfNeededProcess
-    command: ["bash", "-c",
-      "mkdir -p \"$(dirname " + '"' + root.notifiedStatePath + '"' + ")\"; " +
-      "[[ -f \"" + root.notifiedStatePath + "\" ]] && exit 0; " +
-      "touch \"" + root.notifiedStatePath + "\"; " +
-      "omarchy-notification-send -u normal " +
-      "'Thunderbolt dock may need a fix' " +
-      "'USB/Ethernet behind a Thunderbolt dock look unbound due to a firmware PCIe bug. Run: " + root.fixScript + "'"
-    ]
+    id: notifyProcess
   }
 
   Timer {
     // Shortly after shell start covers a dock already connected at login;
-    // the slow periodic timer below catches one plugged in later.
+    // the slow periodic timer below catches one plugged in later, or a
+    // needed -> staged transition after you've run the fix mid-session.
     interval: 15000
     running: true
     repeat: false

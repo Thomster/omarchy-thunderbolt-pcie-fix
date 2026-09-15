@@ -31,7 +31,7 @@
 # on its own -- this is a one-time bootstrapping fix, not an ongoing one.
 #
 # Usage:
-#   omarchy-thunderbolt-pcie-fix --check [--quiet]   # read-only; exit 0 = fine, 1 = needs fix
+#   omarchy-thunderbolt-pcie-fix --check [--quiet]   # read-only; exit 0 = fine, 1 = needs fix, 2 = staged, reboot to finish
 #   sudo omarchy-thunderbolt-pcie-fix [--force]      # apply the fix
 #
 # --force skips the detection gate and applies pci=realloc=on regardless
@@ -64,6 +64,11 @@ Usage:
       Refuses to do anything unless the detection check finds the bug's
       signature, unless --force is given. Always reboot afterward to
       test -- this cannot take effect without one.
+
+Exit codes for --check: 0 = nothing to do (already active, or no
+symptoms found), 1 = symptoms detected and the fix has not been run
+yet, 2 = the fix has already been run (staged in /etc/kernel/cmdline)
+but you haven't rebooted since -- just reboot, don't re-run the fix.
 USAGE
 }
 
@@ -82,6 +87,17 @@ log() { (( QUIET )) || echo "$@"; }
 
 already_fixed() {
   grep -qw "$PARAM" /proc/cmdline 2>/dev/null
+}
+
+# /etc/kernel/cmdline is world-readable, unlike /boot/limine.conf (root
+# only), so this is the only staged-vs-missing signal the unprivileged
+# background check can see. Good enough in practice: the only thing that
+# ever writes this param into /etc/kernel/cmdline is this script's own fix
+# path, which always patches the bootloader in the same run -- so seeing it
+# here reliably means a fix has already been applied and is just waiting
+# on a reboot, not that it still needs to be run.
+staged_pending_reboot() {
+  grep -qw "$PARAM" "$CMDLINE_FILE" 2>/dev/null
 }
 
 # Conservative on purpose: only true when a Thunderbolt device is actually
@@ -103,6 +119,12 @@ run_check() {
   if already_fixed; then
     log "pci=realloc=on is active on the running kernel. Nothing to do."
     return 0
+  fi
+
+  if staged_pending_reboot; then
+    log "$PARAM is already staged (found in $CMDLINE_FILE from a previous run) but hasn't taken effect yet."
+    log "Reboot to activate it: systemctl reboot"
+    return 2
   fi
 
   if detect_symptom; then
@@ -201,6 +223,11 @@ run_fix() {
 
   if already_fixed; then
     log "pci=realloc=on is already active on the running kernel. Nothing to do."
+    exit 0
+  fi
+
+  if staged_pending_reboot; then
+    log "$PARAM is already staged from a previous run. Reboot to activate it: systemctl reboot"
     exit 0
   fi
 
