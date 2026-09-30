@@ -97,6 +97,10 @@ Unlike my other Omarchy plugins, this one isn't a bar widget or a
 UI-adjacent background service — it's a hardware/firmware workaround.
 Nothing else in my other repos depends on it or is required by it.
 
+## Changelog
+
+Current version: **1.1.2**. See [CHANGELOG.md](CHANGELOG.md).
+
 ## How this came to be
 
 This is a personal customization for my own Omarchy setup, built with the
